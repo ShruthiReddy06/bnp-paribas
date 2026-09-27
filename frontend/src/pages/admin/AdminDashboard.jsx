@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import { useAuth } from '../../auth/useAuth.js'
-import { deleteJob, deleteUser, getAdminJobs, getApplications, getCandidates, getShortlistThreshold, getUsers, updateShortlistThreshold } from '../../api/admin.js'
+import { assignCandidateTest, assignInterviewer, deleteJob, deleteUser, getAdminJobs, getApplications, getCandidates, getShortlistThreshold, getUsers, updateShortlistThreshold } from '../../api/admin.js'
 import DataTable from '../../components/DataTable.jsx'
 import StatusBadge from '../../components/StatusBadge.jsx'
 import { createJob } from '../../api/jobs.js'
@@ -18,9 +18,12 @@ export default function AdminDashboard() {
   const [jobs, setJobs] = useState([])
   const [users, setUsers] = useState([])
   const [applications, setApplications] = useState([])
+  const [interviewerSelections, setInterviewerSelections] = useState({})
+  const [assigningTestIds, setAssigningTestIds] = useState({})
   const [threshold, setThreshold] = useState(70)
   const [job, setJob] = useState({ title: '', description: '', location: '', type: 'Full-time', experience_years: 0, education: '', must_have: '', nice_to_have: '' })
   const [error, setError] = useState('')
+  const [assignmentNotice, setAssignmentNotice] = useState('')
 
   useEffect(() => {
     Promise.all([getCandidates(auth.token), getAdminJobs(auth.token), getUsers(auth.token), getApplications(auth.token), getShortlistThreshold(auth.token)])
@@ -32,6 +35,27 @@ export default function AdminDashboard() {
         setThreshold(thresholdData.threshold)
       })
       .catch((err) => setError(err.message))
+  }, [auth.token])
+
+  useEffect(() => {
+    let isActive = true
+    const refreshResults = () => {
+      Promise.all([getApplications(auth.token), getCandidates(auth.token)])
+        .then(([applicationRows, candidateRows]) => {
+          if (isActive) {
+            setApplications(applicationRows)
+            setCandidates(candidateRows)
+          }
+        })
+        .catch((err) => { if (isActive) setError(err.message) })
+    }
+    const intervalId = window.setInterval(refreshResults, 10000)
+    window.addEventListener('focus', refreshResults)
+    return () => {
+      isActive = false
+      window.clearInterval(intervalId)
+      window.removeEventListener('focus', refreshResults)
+    }
   }, [auth.token])
 
   async function handleCreateJob(event) {
@@ -59,6 +83,38 @@ export default function AdminDashboard() {
       setCandidates(await getCandidates(auth.token))
     } catch (err) {
       setError(err.message)
+    }
+  }
+
+  async function handleAssignInterviewer(application) {
+    const interviewerUsername = interviewerSelections[application.id] || application.interviewer_username
+    if (!interviewerUsername) {
+      setError('Choose an interviewer before assigning this application.')
+      return
+    }
+    try {
+      setError('')
+      await assignInterviewer(auth.token, application.id, interviewerUsername)
+      setApplications(await getApplications(auth.token))
+    } catch (err) {
+      setError(err.message)
+    }
+  }
+
+  async function handleAssignTest(application) {
+    setAssigningTestIds((current) => ({ ...current, [application.id]: true }))
+    setError('')
+    setAssignmentNotice('')
+    try {
+      const assignedTest = await assignCandidateTest(auth.token, application.id)
+      setAssignmentNotice(assignedTest.generation_mode === 'standard'
+        ? 'A standard assessment was assigned because Groq is not configured.'
+        : 'AI-generated assessment assigned.')
+      setApplications(await getApplications(auth.token))
+    } catch (err) {
+      setError(err.message)
+    } finally {
+      setAssigningTestIds((current) => ({ ...current, [application.id]: false }))
     }
   }
 
@@ -91,6 +147,7 @@ export default function AdminDashboard() {
         <span className="admin-status"><span /> System active</span>
       </header>
       {error && <p className="error">{error}</p>}
+      {assignmentNotice && <p className="success" role="status">{assignmentNotice}</p>}
       <section className="admin-stats">
         <div className="stat-card"><span>Live roles</span><strong>{jobs.length}</strong><small>Available to candidates</small></div>
         <div className="stat-card"><span>Candidates</span><strong>{users.filter((user) => user.role === 'candidate').length}</strong><small>Registered accounts</small></div>
@@ -127,7 +184,7 @@ export default function AdminDashboard() {
         </div>
         <div>
           <div className="section-heading"><div><p className="eyebrow">Review queue</p><h3>Applications</h3></div></div>
-          <div className="table-wrap"><DataTable columns={[{ key: 'username', label: 'Candidate' }, { key: 'job_title', label: 'Role' }, { key: 'score', label: 'Resume score', render: (row) => row.score == null ? 'Pending' : `${row.score}/100` }, { key: 'test_status', label: 'Test performance', render: (row) => row.test_status === 'Completed' ? `${row.test_score}/100` : row.test_status || 'Not started' }, { key: 'interviewer_username', label: 'Interviewer', render: (row) => row.interviewer_username || 'Unassigned' }, { key: 'scheduled_at', label: 'Interview time', render: (row) => row.scheduled_at ? new Date(row.scheduled_at).toLocaleString() : 'Not scheduled' }, { key: 'interview_decision', label: 'Interview decision', render: (row) => row.interview_decision ? <StatusBadge status={row.interview_decision} /> : 'Pending' }, { key: 'interview_feedback', label: 'Feedback', render: (row) => row.interview_feedback || 'Pending' }, { key: 'status', label: 'Status', render: (row) => <StatusBadge status={row.status} /> }, { key: 'resume_filename', label: 'Resume' }]} rows={applications} /></div>
+          <div className="table-wrap"><DataTable columns={[{ key: 'username', label: 'Candidate' }, { key: 'job_title', label: 'Role' }, { key: 'score', label: 'Resume score', render: (row) => row.score == null ? 'Pending' : `${row.score}/100` }, { key: 'test_status', label: 'Test performance', render: (row) => row.test_status === 'Completed' ? `${row.test_score}/100` : row.test_status || (row.status === 'Shortlisted' ? <button className="table-action" type="button" disabled={assigningTestIds[row.id]} onClick={() => handleAssignTest(row)}>{assigningTestIds[row.id] ? 'Generating...' : 'Assign test'}</button> : 'Not assigned') }, { key: 'interviewer_username', label: 'Interviewer', render: (row) => row.status !== 'Interview' ? row.interviewer_username || 'Not assigned' : row.scheduled_at ? row.interviewer_username : <div className="interviewer-assignment"><select aria-label={`Interviewer for ${row.username}`} value={interviewerSelections[row.id] ?? row.interviewer_username ?? ''} onChange={(event) => setInterviewerSelections((current) => ({ ...current, [row.id]: event.target.value }))}><option value="">Choose interviewer</option>{users.filter((user) => user.role === 'interviewer').map((user) => <option key={user.username} value={user.username}>{user.username}</option>)}</select><button className="table-action" type="button" disabled={!interviewerSelections[row.id] && !row.interviewer_username} onClick={() => handleAssignInterviewer(row)}>{row.interviewer_username ? 'Save assignment' : 'Assign'}</button></div> }, { key: 'scheduled_at', label: 'Interview time', render: (row) => row.scheduled_at ? new Date(row.scheduled_at).toLocaleString() : 'Not scheduled' }, { key: 'interview_decision', label: 'Interview decision', render: (row) => row.interview_decision ? <StatusBadge status={row.interview_decision} /> : 'Pending' }, { key: 'interview_feedback', label: 'Feedback', render: (row) => row.interview_feedback || 'Pending' }, { key: 'status', label: 'Status', render: (row) => <StatusBadge status={row.status} /> }, { key: 'resume_filename', label: 'Resume' }]} rows={applications} /></div>
         </div>
       </section>
     </main>

@@ -1,9 +1,12 @@
+from typing import Literal
+
 from pydantic import BaseModel
 
 
 class LoginRequest(BaseModel):
     username: str
     password: str
+    access_scope: Literal['admin', 'standard'] = 'standard'
 
 
 class RegisterRequest(BaseModel):

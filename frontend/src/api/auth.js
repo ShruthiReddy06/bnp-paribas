@@ -1,10 +1,10 @@
 import { apiRequest } from './client.js'
 
 // POST /login -> { token, role, username }
-export function login(username, password) {
+export function login(username, password, accessScope = 'standard') {
   return apiRequest('/login', {
     method: 'POST',
-    body: { username, password }
+    body: { username, password, access_scope: accessScope }
   })
 }
 

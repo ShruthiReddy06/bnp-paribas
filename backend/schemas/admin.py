@@ -17,6 +17,7 @@ class AdminApplicationOut(BaseModel):
     score: Optional[float] = None
     test_status: Optional[str] = None
     test_score: Optional[float] = None
+    test_mode: Optional[str] = None
     performance: Optional[dict] = None
     interview_id: Optional[int] = None
     interviewer_username: Optional[str] = None

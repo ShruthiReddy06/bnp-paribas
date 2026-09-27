@@ -23,6 +23,8 @@ def login(body: LoginRequest):
     user = get_user(body.username)
     if not user or not verify_password(body.password, user):
         raise HTTPException(status_code=401, detail="Invalid username or password")
+    if (body.access_scope == "admin") != (user["role"] == "admin"):
+        raise HTTPException(status_code=403, detail="These credentials do not match this access portal")
 
     token = create_token(body.username)
     return LoginResponse(token=token, role=user["role"], username=body.username)

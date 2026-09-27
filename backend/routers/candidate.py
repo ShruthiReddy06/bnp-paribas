@@ -3,7 +3,7 @@ from uuid import uuid4
 
 from fastapi import APIRouter, Body, Depends, File, HTTPException, UploadFile
 
-from database import CANDIDATE_STATUS, complete_candidate_test, create_application, create_candidate_test, get_applied_job_ids, get_applications, get_candidate_test, get_candidate_test_summaries, get_job_posting, get_job_postings, get_shortlisted_applications, get_started_test, start_candidate_test
+from database import CANDIDATE_STATUS, complete_candidate_test, create_application, create_candidate_test, get_applied_job_ids, get_applications, get_candidate_test_summaries, get_job_posting, get_job_postings, get_started_test, start_candidate_test
 from schemas.interview import InterviewStatusOut
 from schemas.job import ApplicationDetailOut, ApplicationOut, JobPostingOut
 from schemas.test import CandidateTestOut, CandidateTestSummaryOut, TestSubmission
@@ -43,43 +43,8 @@ def candidate_my_applications(user=Depends(require_role("candidate"))):
 
 @router.get("/candidate/tests", response_model=list[CandidateTestSummaryOut])
 def candidate_tests(user=Depends(require_role("candidate"))):
-    """Return one generated test for every shortlisted application."""
+    """Return the tests assigned to this candidate."""
     username, _ = user
-    shortlisted_applications = get_shortlisted_applications(username)
-    if not shortlisted_applications:
-        return []
-
-    from questions_generator.rag_pipeline import generate_interview
-
-    tests = []
-    for application in shortlisted_applications:
-        existing_test = get_candidate_test(application["application_id"])
-        if existing_test:
-            tests.append(existing_test)
-            continue
-
-        resume_path = UPLOAD_DIR / application["resume_path"]
-        if not resume_path.exists():
-            raise HTTPException(status_code=404, detail="The shortlisted resume file could not be found")
-        job_description = (
-            f"Job title: {application['job_title']}\n"
-            f"Job description: {application['job_description']}\n"
-            f"Required skills: {', '.join(application['must_have'])}\n"
-            f"Nice-to-have skills: {', '.join(application['nice_to_have'])}"
-        )
-        try:
-            generated = generate_interview(
-                resume_path=str(resume_path),
-                job_description=job_description,
-                mode="3",
-                total_questions=6,
-                easy_questions=2,
-                medium_questions=2,
-                hard_questions=2,
-            )
-        except Exception as error:
-            raise HTTPException(status_code=502, detail=f"Test generation failed: {error}") from error
-        create_candidate_test(application["application_id"], generated.get("questions", []))
     return get_candidate_test_summaries(username)
 
 
@@ -103,8 +68,6 @@ def candidate_submit_test(test_id: int, body: TestSubmission, user=Depends(requi
     if questions is False:
         raise HTTPException(status_code=409, detail="This test is not available for submission")
     try:
-        from questions_generator.rag_pipeline import evaluate_descriptive_answer
-
         earned = 0.0
         maximum = 0.0
         evaluations = []
@@ -117,6 +80,8 @@ def candidate_submit_test(test_id: int, body: TestSubmission, user=Depends(requi
                 question_score = marks if correct else 0.0
                 evaluation = {"score": question_score, "max_score": marks, "correct": correct}
             else:
+                from questions_generator.rag_pipeline import evaluate_descriptive_answer
+
                 evaluation = evaluate_descriptive_answer(question, answer)
                 question_score = float(evaluation.get("score", 0))
             earned += question_score

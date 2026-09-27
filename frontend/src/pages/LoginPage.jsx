@@ -18,7 +18,7 @@ export default function LoginPage() {
     setError('')
     try {
       const data = mode === 'signin'
-        ? await login(username, password)
+        ? await login(username, password, isAdminAccess ? 'admin' : 'standard')
         : await register(username, password, role)
       navigate(defaultRouteForRole(data.role))
     } catch (err) {

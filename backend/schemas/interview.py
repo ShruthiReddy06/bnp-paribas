@@ -20,6 +20,11 @@ class ScheduleRequest(BaseModel):
     scheduled_at: str
 
 
+class InterviewAssignmentRequest(BaseModel):
+    application_id: int
+    interviewer_username: str
+
+
 class InterviewOut(BaseModel):
     interview_id: int
     application_id: int

@@ -13,6 +13,7 @@ DEFAULT_USERS = {
     "team06": {"password": "06", "role": "admin"},
     "candidate1": {"password": "cand123", "role": "candidate"},
     "interviewer1": {"password": "int123", "role": "interviewer"},
+    "interviewer2": {"password": "int123", "role": "interviewer"},
 }
 
 DEFAULT_JOB_POSTINGS = [
@@ -80,6 +81,7 @@ def initialize_database():
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 application_id INTEGER NOT NULL UNIQUE,
                 status TEXT NOT NULL DEFAULT 'Ready',
+                generation_mode TEXT NOT NULL DEFAULT 'ai',
                 score REAL,
                 answers TEXT,
                 performance TEXT
@@ -111,12 +113,37 @@ def initialize_database():
             """
         )
         test_columns = {row[1] for row in connection.execute("PRAGMA table_info(candidate_tests)")}
+        if "generation_mode" not in test_columns:
+            connection.execute("ALTER TABLE candidate_tests ADD COLUMN generation_mode TEXT NOT NULL DEFAULT 'ai'")
         if "answers" not in test_columns:
             connection.execute("ALTER TABLE candidate_tests ADD COLUMN answers TEXT")
         if "performance" not in test_columns:
             connection.execute("ALTER TABLE candidate_tests ADD COLUMN performance TEXT")
         connection.execute(
             "INSERT OR IGNORE INTO app_settings (key, value) VALUES ('shortlist_threshold', '70')"
+        )
+        threshold_row = connection.execute(
+            "SELECT value FROM app_settings WHERE key = 'shortlist_threshold'"
+        ).fetchone()
+        test_threshold = float(threshold_row[0]) if threshold_row else 70.0
+        connection.execute(
+            """
+            UPDATE applications
+            SET status = CASE WHEN (
+                SELECT candidate_tests.score
+                FROM candidate_tests
+                WHERE candidate_tests.application_id = applications.id
+                  AND candidate_tests.status = 'Completed'
+            ) >= ? THEN 'Interview' ELSE 'Rejected' END
+            WHERE applications.status IN ('Shortlisted', 'Test completed', 'Disqualified')
+              AND EXISTS (
+                  SELECT 1 FROM candidate_tests
+                  WHERE candidate_tests.application_id = applications.id
+                    AND candidate_tests.status = 'Completed'
+                    AND candidate_tests.score IS NOT NULL
+              )
+            """,
+            (test_threshold,),
         )
         columns = {row[1] for row in connection.execute("PRAGMA table_info(applications)")}
         if "resume_filename" not in columns:
@@ -229,6 +256,10 @@ def set_shortlist_threshold(threshold: float):
             UPDATE applications
             SET status = CASE WHEN score >= ? THEN 'Shortlisted' ELSE 'Not shortlisted' END
             WHERE score IS NOT NULL
+                            AND NOT EXISTS (
+                                    SELECT 1 FROM candidate_tests
+                                    WHERE candidate_tests.application_id = applications.id
+                            )
             """,
             (threshold,),
         )
@@ -363,6 +394,7 @@ def get_admin_applications():
             SELECT applications.id, applications.username, job_postings.title,
                                      applications.status, applications.resume_filename, applications.score,
                                      candidate_tests.status, candidate_tests.score, candidate_tests.performance,
+                                     candidate_tests.generation_mode,
                                      interviews.id, interviews.interviewer_username, interviews.scheduled_at,
                                      interviews.candidate_confirmed, interviews.interviewer_confirmed,
                                      interviews.decision, interviews.feedback
@@ -378,10 +410,11 @@ def get_admin_applications():
          "status": row[3], "resume_filename": row[4], "score": row[5],
          "test_status": row[6], "test_score": row[7],
          "performance": json.loads(row[8]) if row[8] else None,
-         "interview_id": row[9], "interviewer_username": row[10], "scheduled_at": row[11],
-         "candidate_confirmed": bool(row[12]) if row[12] is not None else None,
-         "interviewer_confirmed": bool(row[13]) if row[13] is not None else None,
-         "interview_decision": row[14], "interview_feedback": row[15]}
+         "test_mode": row[9], "interview_id": row[10],
+         "interviewer_username": row[11], "scheduled_at": row[12],
+         "candidate_confirmed": bool(row[13]) if row[13] is not None else None,
+         "interviewer_confirmed": bool(row[14]) if row[14] is not None else None,
+         "interview_decision": row[15], "interview_feedback": row[16]}
         for row in rows
     ]
 
@@ -408,10 +441,32 @@ def get_shortlisted_applications(username: str):
     ]
 
 
+def get_shortlisted_application(application_id: int):
+    with sqlite3.connect(DB_PATH) as connection:
+        row = connection.execute(
+            """
+            SELECT applications.id, applications.resume_path, applications.username,
+                   job_postings.title, job_postings.description,
+                   job_postings.must_have, job_postings.nice_to_have
+            FROM applications
+            JOIN job_postings ON job_postings.id = applications.job_id
+            WHERE applications.id = ? AND applications.status = 'Shortlisted'
+            """,
+            (application_id,),
+        ).fetchone()
+    if not row:
+        return None
+    return {
+        "application_id": row[0], "resume_path": row[1], "username": row[2],
+        "job_title": row[3], "job_description": row[4],
+        "must_have": json.loads(row[5]), "nice_to_have": json.loads(row[6]),
+    }
+
+
 def get_candidate_test(application_id: int):
     with sqlite3.connect(DB_PATH) as connection:
         test = connection.execute(
-            "SELECT id, status, score FROM candidate_tests WHERE application_id = ?",
+            "SELECT id, status, score, generation_mode FROM candidate_tests WHERE application_id = ?",
             (application_id,),
         ).fetchone()
         if not test:
@@ -420,7 +475,7 @@ def get_candidate_test(application_id: int):
             "SELECT payload FROM test_questions WHERE test_id = ? ORDER BY position",
             (test[0],),
         ).fetchall()
-    return {"id": test[0], "status": test[1], "score": test[2],
+    return {"id": test[0], "status": test[1], "score": test[2], "generation_mode": test[3],
             "questions": [json.loads(row[0]) for row in questions]}
 
 
@@ -428,8 +483,9 @@ def get_candidate_test_summaries(username: str):
     with sqlite3.connect(DB_PATH) as connection:
         rows = connection.execute(
             """
-            SELECT candidate_tests.id, candidate_tests.status, candidate_tests.score,
-                   COUNT(test_questions.id)
+                     SELECT candidate_tests.id, candidate_tests.status, candidate_tests.score,
+                     candidate_tests.generation_mode,
+                         COUNT(test_questions.id), applications.status
             FROM candidate_tests
             JOIN applications ON applications.id = candidate_tests.application_id
             LEFT JOIN test_questions ON test_questions.test_id = candidate_tests.id
@@ -439,14 +495,17 @@ def get_candidate_test_summaries(username: str):
             """,
             (username,),
         ).fetchall()
-    return [{"id": row[0], "status": row[1], "score": row[2], "question_count": row[3]} for row in rows]
+    return [{"id": row[0], "status": row[1], "score": row[2],
+             "generation_mode": row[3], "question_count": row[4],
+             "application_status": row[5]} for row in rows]
 
 
 def start_candidate_test(username: str, test_id: int):
     with sqlite3.connect(DB_PATH) as connection:
         row = connection.execute(
             """
-            SELECT candidate_tests.id, candidate_tests.status, candidate_tests.score
+                 SELECT candidate_tests.id, candidate_tests.status, candidate_tests.score,
+                     candidate_tests.generation_mode
             FROM candidate_tests
             JOIN applications ON applications.id = candidate_tests.application_id
             WHERE candidate_tests.id = ? AND applications.username = ?
@@ -463,7 +522,7 @@ def start_candidate_test(username: str, test_id: int):
             "SELECT payload FROM test_questions WHERE test_id = ? ORDER BY position",
             (test_id,),
         ).fetchall()
-    return {"id": row[0], "status": "Started", "score": row[2],
+    return {"id": row[0], "status": "Started", "score": row[2], "generation_mode": row[3],
             "questions": [json.loads(question[0]) for question in questions]}
 
 
@@ -536,7 +595,7 @@ def complete_candidate_test(username: str, test_id: int, answers: dict[str, str]
         ).fetchone()
         if not owned:
             return False
-        application_status = "Interview" if score > 70 else "Test completed"
+        application_status = "Interview" if score >= get_shortlist_threshold() else "Rejected"
         connection.execute(
             "UPDATE candidate_tests SET status = 'Completed', score = ?, answers = ?, performance = ? WHERE id = ?",
             (score, json.dumps(answers), json.dumps(performance), test_id),
@@ -558,9 +617,9 @@ def get_interviewer_candidates(interviewer_username: str):
                    interviews.decision, interviews.feedback
             FROM applications
             JOIN job_postings ON job_postings.id = applications.job_id
-            LEFT JOIN interviews ON interviews.application_id = applications.id
+                        JOIN interviews ON interviews.application_id = applications.id
             WHERE applications.status = 'Interview'
-              AND (interviews.interviewer_username IS NULL OR interviews.interviewer_username = ?)
+                            AND interviews.interviewer_username = ?
             ORDER BY applications.id DESC
             """,
             (interviewer_username,),
@@ -573,6 +632,61 @@ def get_interviewer_candidates(interviewer_username: str):
     ]
 
 
+def assign_interviewer(application_id: int, interviewer_username: str):
+    with sqlite3.connect(DB_PATH) as connection:
+        interviewer = connection.execute(
+            "SELECT role FROM users WHERE username = ?",
+            (interviewer_username,),
+        ).fetchone()
+        if not interviewer or interviewer[0] != "interviewer":
+            return False
+        eligible = connection.execute(
+            "SELECT id FROM applications WHERE id = ? AND status = 'Interview'",
+            (application_id,),
+        ).fetchone()
+        if not eligible:
+            return None
+        existing = connection.execute(
+            "SELECT id, interviewer_username, scheduled_at, candidate_confirmed, interviewer_confirmed, decision, feedback "
+            "FROM interviews WHERE application_id = ?",
+            (application_id,),
+        ).fetchone()
+        if existing and existing[5]:
+            return None
+        if existing and existing[1] == interviewer_username:
+            return {
+                "interview_id": existing[0], "application_id": application_id,
+                "interviewer_username": existing[1], "scheduled_at": existing[2],
+                "candidate_confirmed": bool(existing[3]), "interviewer_confirmed": bool(existing[4]),
+                "decision": existing[5], "feedback": existing[6],
+            }
+        connection.execute(
+            """
+            INSERT INTO interviews (application_id, interviewer_username)
+            VALUES (?, ?)
+            ON CONFLICT(application_id) DO UPDATE SET
+                interviewer_username = excluded.interviewer_username,
+                scheduled_at = NULL,
+                candidate_confirmed = 0,
+                interviewer_confirmed = 0,
+                decision = NULL,
+                feedback = NULL
+            """,
+            (application_id, interviewer_username),
+        )
+        row = connection.execute(
+            "SELECT id, scheduled_at, candidate_confirmed, interviewer_confirmed, decision, feedback "
+            "FROM interviews WHERE application_id = ?",
+            (application_id,),
+        ).fetchone()
+    return {
+        "interview_id": row[0], "application_id": application_id,
+        "interviewer_username": interviewer_username, "scheduled_at": row[1],
+        "candidate_confirmed": bool(row[2]), "interviewer_confirmed": bool(row[3]),
+        "decision": row[4], "feedback": row[5],
+    }
+
+
 def schedule_interview(application_id: int, interviewer_username: str, scheduled_at: str):
     with sqlite3.connect(DB_PATH) as connection:
         eligible = connection.execute(
@@ -581,17 +695,15 @@ def schedule_interview(application_id: int, interviewer_username: str, scheduled
         ).fetchone()
         if not eligible:
             return None
+        assigned = connection.execute(
+            "SELECT id FROM interviews WHERE application_id = ? AND interviewer_username = ?",
+            (application_id, interviewer_username),
+        ).fetchone()
+        if not assigned:
+            return None
         connection.execute(
-            """
-            INSERT INTO interviews (application_id, interviewer_username, scheduled_at, interviewer_confirmed)
-            VALUES (?, ?, ?, 1)
-            ON CONFLICT(application_id) DO UPDATE SET
-                interviewer_username = excluded.interviewer_username,
-                scheduled_at = excluded.scheduled_at,
-                interviewer_confirmed = 1,
-                candidate_confirmed = 0
-            """,
-            (application_id, interviewer_username, scheduled_at),
+            "UPDATE interviews SET scheduled_at = ?, interviewer_confirmed = 1, candidate_confirmed = 0 WHERE id = ?",
+            (scheduled_at, assigned[0]),
         )
         row = connection.execute(
             "SELECT id, scheduled_at, candidate_confirmed, interviewer_confirmed, decision, feedback FROM interviews WHERE application_id = ?",
@@ -644,11 +756,13 @@ def confirm_interview(username: str, interview_id: int):
 def submit_interview_decision(interview_id: int, interviewer_username: str, decision: str, feedback: str):
     with sqlite3.connect(DB_PATH) as connection:
         row = connection.execute(
-            "SELECT application_id FROM interviews WHERE id = ? AND interviewer_username = ?",
+            "SELECT application_id, scheduled_at FROM interviews WHERE id = ? AND interviewer_username = ?",
             (interview_id, interviewer_username),
         ).fetchone()
         if not row:
             return None
+        if not row[1]:
+            return False
         connection.execute(
             "UPDATE interviews SET decision = ?, feedback = ? WHERE id = ?",
             (decision, feedback, interview_id),
@@ -660,18 +774,19 @@ def submit_interview_decision(interview_id: int, interviewer_username: str, deci
     return True
 
 
-def create_candidate_test(application_id: int, questions: list[dict]):
+def create_candidate_test(application_id: int, questions: list[dict], generation_mode: str = "ai"):
     with sqlite3.connect(DB_PATH) as connection:
         cursor = connection.execute(
-            "INSERT INTO candidate_tests (application_id) VALUES (?)",
-            (application_id,),
+            "INSERT INTO candidate_tests (application_id, generation_mode) VALUES (?, ?)",
+            (application_id, generation_mode),
         )
         test_id = cursor.lastrowid
         connection.executemany(
             "INSERT INTO test_questions (test_id, position, payload) VALUES (?, ?, ?)",
             [(test_id, position, json.dumps(question)) for position, question in enumerate(questions)],
         )
-    return {"id": test_id, "status": "Ready", "score": None, "questions": questions}
+        return {"id": test_id, "status": "Ready", "score": None,
+            "generation_mode": generation_mode, "questions": questions}
 
 
 initialize_database()

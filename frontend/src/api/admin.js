@@ -13,6 +13,17 @@ export function getApplications(token) {
   return apiRequest('/admin/applications', { token })
 }
 
+export function assignCandidateTest(token, applicationId) {
+  return apiRequest(`/admin/applications/${applicationId}/assign-test`, { method: 'POST', token })
+}
+
+export function assignInterviewer(token, applicationId, interviewerUsername) {
+  return apiRequest('/admin/interviews/assign', {
+    method: 'POST', token,
+    body: { application_id: applicationId, interviewer_username: interviewerUsername }
+  })
+}
+
 export function getAdminJobs(token) {
   return apiRequest('/admin/jobs', { token })
 }
