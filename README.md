@@ -246,3 +246,4 @@ This project is provided for educational and prototype use.
 ## Contributing
 
 Contributions are welcome. For improvements, create a feature branch, make your changes, and open a pull request with a clear summary of the update.
+ 
